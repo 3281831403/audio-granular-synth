@@ -12,15 +12,96 @@
 * 浮点比较使用绝对容差 ``1e-6``；越界读取一律补 ``0.0``，不得抛
   ``IndexError``。
 * 参数、源样本或批量配置非法时统一抛出 :class:`GranularError`。
-
-本模块初始为练习桩：8 个函数均抛出 ``NotImplementedError``，等待实现。
 """
 
 from __future__ import annotations
 
+import math
+
+_MASK64 = (1 << 64) - 1
+_ENVELOPE_SHAPES = ("hann", "tukey", "rect")
+
 
 class GranularError(ValueError):
     """颗粒合成参数、源样本或批量配置非法时抛出的异常。"""
+
+
+# ---------------------------------------------------------------------------
+# 内部辅助
+# ---------------------------------------------------------------------------
+
+
+def _is_int(value) -> bool:
+    """``bool`` 虽然是 ``int`` 的子类，但不应被当作整数参数。"""
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _to_finite_float(value):
+    """把数值转成有限 ``float``；非法、``NaN``、``inf`` 时返回 ``None``。"""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        result = float(value)
+    except (OverflowError, ValueError):
+        return None
+    if not math.isfinite(result):
+        return None
+    return result
+
+
+def _require_finite(value, name: str) -> float:
+    result = _to_finite_float(value)
+    if result is None:
+        raise GranularError(f"{name} 必须是有限数值")
+    return result
+
+
+def _require_positive(value, name: str) -> float:
+    result = _require_finite(value, name)
+    if result <= 0.0:
+        raise GranularError(f"{name} 必须大于 0")
+    return result
+
+
+def _require_seed(seed) -> int:
+    if not _is_int(seed):
+        raise GranularError("seed 必须是整数")
+    return seed
+
+
+def _mix64(value: int) -> int:
+    """splitmix64 的确定性混合函数，不依赖平台随机化。"""
+    value = (value + 0x9E3779B97F4A7C15) & _MASK64
+    value = ((value ^ (value >> 30)) * 0xBF58476D1CE4E5B9) & _MASK64
+    value = ((value ^ (value >> 27)) * 0x94D049BB133111EB) & _MASK64
+    return (value ^ (value >> 31)) & _MASK64
+
+
+def _hash_unit(seed: int, index: int) -> float:
+    """把 ``(seed, index)`` 映射到 ``[0.0, 1.0)``，完全可复现。"""
+    product = ((index & _MASK64) * 0x9E3779B97F4A7C15) & _MASK64
+    combined = (seed & _MASK64) ^ product
+    return _mix64(combined) / float(1 << 64)
+
+
+def _validate_samples(samples, name: str = "samples") -> list[float]:
+    """校验样本为非空、只含有限数值的序列，并返回浮点副本。"""
+    if not isinstance(samples, (list, tuple)):
+        raise GranularError(f"{name} 必须是数值列表")
+    if len(samples) == 0:
+        raise GranularError(f"{name} 不能为空")
+    values: list[float] = []
+    for value in samples:
+        numeric = _to_finite_float(value)
+        if numeric is None:
+            raise GranularError(f"{name} 只能包含有限数值")
+        values.append(numeric)
+    return values
+
+
+# ---------------------------------------------------------------------------
+# 公开接口
+# ---------------------------------------------------------------------------
 
 
 def grain_schedule(duration_ms: float, density: float, seed: int) -> list[float]:
@@ -41,7 +122,31 @@ def grain_schedule(duration_ms: float, density: float, seed: int) -> list[float]
     * 不修改输入，不返回 ``NaN`` 或无限值。
     """
 
-    raise NotImplementedError("grain_schedule 尚未实现")
+    duration = _require_positive(duration_ms, "duration_ms")
+    dens = _require_positive(density, "density")
+    seed = _require_seed(seed)
+
+    count = max(1, int(math.floor(duration * dens / 1000.0 + 0.5)))
+    slot_width = 1000.0 / dens
+    # 保证最后一个槽位的抖动后位置仍严格小于 duration_ms。
+    upper_limit = math.nextafter(duration, 0.0)
+
+    starts: list[float] = []
+    for i in range(count):
+        if i == 0:
+            starts.append(0.0)
+            continue
+        unit = _hash_unit(seed, i)
+        offset = (unit - 0.5) * slot_width
+        position = i * slot_width + offset
+        if position < 0.0:
+            position = 0.0
+        elif position >= duration:
+            position = upper_limit
+        starts.append(position)
+
+    starts.sort()
+    return starts
 
 
 def grain_envelope(length: int, shape: str) -> list[float]:
@@ -61,7 +166,42 @@ def grain_envelope(length: int, shape: str) -> list[float]:
     * 端点、峰值和平台比较均使用绝对容差 ``1e-6``。
     """
 
-    raise NotImplementedError("grain_envelope 尚未实现")
+    if not _is_int(length) or length < 1:
+        raise GranularError("length 必须是 >= 1 的整数")
+    if not isinstance(shape, str) or shape not in _ENVELOPE_SHAPES:
+        raise GranularError("shape 只能是 'hann'、'tukey' 或 'rect'")
+
+    if length == 1:
+        return [1.0]
+
+    if shape == "rect":
+        return [1.0] * length
+
+    if shape == "hann":
+        denominator = length - 1
+        return [
+            0.5 - 0.5 * math.cos(2.0 * math.pi * i / denominator)
+            for i in range(length)
+        ]
+
+    # Tukey（alpha = 0.5）：两端余弦过渡，中间为幅度 1 的平台。
+    alpha = 0.5
+    n_minus_1 = length - 1
+    edge = alpha * n_minus_1 / 2.0
+    flat_end = n_minus_1 - edge
+    result: list[float] = []
+    for n in range(length):
+        if n < edge:
+            value = 0.5 * (1.0 + math.cos(math.pi * (n / edge - 1.0)))
+        elif n > flat_end:
+            value = 0.5 * (
+                1.0 + math.cos(math.pi * (n / edge - 2.0 / alpha + 1.0))
+            )
+        else:
+            value = 1.0
+        # 余弦的浮点误差可能让结果略微越界。
+        result.append(min(1.0, max(0.0, value)))
+    return result
 
 
 def read_grain(
@@ -92,7 +232,27 @@ def read_grain(
     * 返回新列表，不修改 ``samples``。
     """
 
-    raise NotImplementedError("read_grain 尚未实现")
+    values = _validate_samples(samples)
+    start = _require_finite(start_ms, "start_ms")
+    if start < 0.0:
+        raise GranularError("start_ms 必须 >= 0")
+    length = _require_positive(length_ms, "length_ms")
+    sr = _require_positive(sample_rate, "sample_rate")
+    speed = _require_positive(rate, "rate")
+
+    out_len = max(1, int(math.floor(length * sr / 1000.0 + 0.5)))
+    base = start * sr / 1000.0
+    count = len(values)
+
+    result: list[float] = []
+    for i in range(out_len):
+        position = base + i * speed
+        index = math.floor(position)
+        fraction = position - index
+        left = values[index] if 0 <= index < count else 0.0
+        right = values[index + 1] if 0 <= index + 1 < count else 0.0
+        result.append(left + (right - left) * fraction)
+    return result
 
 
 def overlap_add(
@@ -118,7 +278,39 @@ def overlap_add(
     * 浮点比较使用绝对容差 ``1e-6``。
     """
 
-    raise NotImplementedError("overlap_add 尚未实现")
+    if not isinstance(grains, (list, tuple)):
+        raise GranularError("grains 必须是列表")
+    if not isinstance(positions, (list, tuple)):
+        raise GranularError("positions 必须是列表")
+    if len(grains) != len(positions):
+        raise GranularError("grains 与 positions 长度必须相等")
+    if not _is_int(total_len) or total_len < 1:
+        raise GranularError("total_len 必须是 >= 1 的整数")
+    for position in positions:
+        if not _is_int(position) or position < 0:
+            raise GranularError("positions 必须是非负整数")
+
+    output = [0.0] * total_len
+    coverage = [0] * total_len
+
+    # 每个颗粒独立累加，绝不共享或复用其他颗粒/源的缓冲。
+    for grain, position in zip(grains, positions):
+        if not isinstance(grain, (list, tuple)):
+            raise GranularError("grains 的每个元素都必须是数值列表")
+        for offset, value in enumerate(grain):
+            numeric = _to_finite_float(value)
+            if numeric is None:
+                raise GranularError("颗粒采样只能包含有限数值")
+            target = position + offset
+            if target >= total_len:
+                break
+            output[target] += numeric
+            coverage[target] += 1
+
+    for t in range(total_len):
+        if coverage[t] > 0:
+            output[t] /= coverage[t]
+    return output
 
 
 def pitch_jitter(freq: float, spread: float, seed: int) -> float:
@@ -136,7 +328,22 @@ def pitch_jitter(freq: float, spread: float, seed: int) -> float:
     * ``spread == 0`` 时精确返回 ``freq``。结果必须是有限正数。
     """
 
-    raise NotImplementedError("pitch_jitter 尚未实现")
+    base_freq = _require_positive(freq, "freq")
+    amount = _require_finite(spread, "spread")
+    if amount < 0.0:
+        raise GranularError("spread 必须 >= 0")
+    seed = _require_seed(seed)
+
+    if amount == 0.0:
+        return base_freq
+
+    unit = _hash_unit(seed, 0)
+    offset = (2.0 * unit - 1.0) * amount
+    factor = 1.0 + offset
+    if factor <= 0.0:
+        # 极端 spread 下仍保证结果是有限正数。
+        factor = math.nextafter(0.0, 1.0)
+    return base_freq * factor
 
 
 def spray_position(base_ms: float, spray_ms: float, seed: int) -> float:
@@ -159,7 +366,21 @@ def spray_position(base_ms: float, spray_ms: float, seed: int) -> float:
       不同位置；返回值是有限浮点数。
     """
 
-    raise NotImplementedError("spray_position 尚未实现")
+    source_ms = _require_positive(base_ms, "base_ms")
+    base_position = _require_finite(spray_ms, "spray_ms")
+    if base_position < 0.0:
+        raise GranularError("spray_ms 必须 >= 0")
+    seed = _require_seed(seed)
+
+    amplitude = min(20.0, 0.1 * source_ms)
+    unit = _hash_unit(seed, 0)
+    position = base_position + (2.0 * unit - 1.0) * amplitude
+
+    if position < 0.0:
+        position = 0.0
+    elif position > source_ms:
+        position = source_ms
+    return position
 
 
 def validate_params(params: dict) -> list[str]:
@@ -180,7 +401,21 @@ def validate_params(params: dict) -> list[str]:
     * 浮点比较使用绝对容差 ``1e-6``；本函数只读取 ``params``，不修改输入。
     """
 
-    raise NotImplementedError("validate_params 尚未实现")
+    if not isinstance(params, dict):
+        return ["params 必须是 dict，且包含 length_ms、density、rate"]
+
+    issues: list[str] = []
+    for field in ("length_ms", "density", "rate"):
+        if field not in params:
+            issues.append(f"缺少字段 {field}")
+            continue
+        value = _to_finite_float(params[field])
+        if value is None:
+            issues.append(f"{field} 必须是有限数值")
+            continue
+        if value <= 1e-6:
+            issues.append(f"{field} 必须大于 0")
+    return issues
 
 
 def granular_batch(sources: dict, config: dict) -> dict:
@@ -212,4 +447,61 @@ def granular_batch(sources: dict, config: dict) -> dict:
       ``config``。
     """
 
-    raise NotImplementedError("granular_batch 尚未实现")
+    if not isinstance(sources, dict):
+        raise GranularError("sources 必须是 dict")
+    if not isinstance(config, dict):
+        raise GranularError("config 必须是 dict")
+
+    required = ("density", "length_ms", "sample_rate", "rate", "seed", "shape")
+    for key in required:
+        if key not in config:
+            raise GranularError(f"config 缺少字段 {key}")
+
+    issues = validate_params(config)
+    if issues:
+        raise GranularError("; ".join(issues))
+
+    sample_rate = _require_positive(config["sample_rate"], "sample_rate")
+    seed = _require_seed(config["seed"])
+    shape = config["shape"]
+    if not isinstance(shape, str) or shape not in _ENVELOPE_SHAPES:
+        raise GranularError("shape 只能是 'hann'、'tukey' 或 'rect'")
+
+    density = float(config["density"])
+    length_ms = float(config["length_ms"])
+    rate = float(config["rate"])
+
+    # 先整体校验全部源，确保任一坏源都会让整次批量渲染回滚。
+    validated_sources: dict[str, list[float]] = {}
+    for name, samples in sources.items():
+        values = _validate_samples(samples, f"sources[{name!r}]")
+        for value in values:
+            if value < -1.0 - 1e-6 or value > 1.0 + 1e-6:
+                raise GranularError(f"sources[{name!r}] 采样超出 -1.0 .. 1.0")
+        validated_sources[name] = values
+
+    grain_len = max(1, int(math.floor(length_ms * sample_rate / 1000.0 + 0.5)))
+    envelope = grain_envelope(grain_len, shape)
+
+    rendered: dict[str, list[float]] = {}
+    for name, samples in validated_sources.items():
+        duration_ms = len(samples) / sample_rate * 1000.0
+        starts = grain_schedule(duration_ms, density, seed)
+
+        grains: list[list[float]] = []
+        positions: list[int] = []
+        for start_ms in starts:
+            grain = read_grain(samples, start_ms, length_ms, sample_rate, rate)
+            # read_grain 与 grain_len 使用同一取整公式，长度天然一致；
+            # 仍按较短者截断以防御未来改动。
+            windowed = [
+                grain[i] * envelope[i] for i in range(min(len(grain), grain_len))
+            ]
+            grains.append(windowed)
+            positions.append(int(math.floor(start_ms * sample_rate / 1000.0 + 0.5)))
+
+        # 最后一个颗粒的结束位置；starts 升序，因此它就是缓冲总长。
+        total_len = max(1, positions[-1] + grain_len)
+        rendered[name] = overlap_add(grains, positions, total_len)
+
+    return rendered
